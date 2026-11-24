@@ -26,14 +26,15 @@ const MAX_OPEN = 5;
 const MAX_ORDERS_PER_BATCH = 16;
 const BUY_SLIPPAGE_BPS = 300;
 const SELL_SLIPPAGE_BPS = 2000;
-const MIN_REAL_QUOTE = 3n * LAMPORTS_PER_SOL;
-const MIN_TRADES_TO_ENTER = 6;
+const MIN_REAL_QUOTE = 5n * LAMPORTS_PER_SOL;
+const MIN_TRADES_TO_ENTER = 8;
 const MIN_BUY_VOLUME = 500_000_000n;
-const TAKE_PROFIT_BPS = 12800;
-const STOP_LOSS_BPS = 8800;
-const TRAILING_DROP_BPS = 800;
-const TRAILING_ARMS_AT_BPS = 12000;
-const MAX_HOLD_SLOTS = 3600;
+const TAKE_PROFIT_BPS = 11800;
+const STOP_LOSS_BPS = 9200;
+const TRAILING_DROP_BPS = 600;
+const TRAILING_ARMS_AT_BPS = 11200;
+const MAX_HOLD_SLOTS = 1200;
+const MIN_BUY_COOLDOWN_SLOTS = 150;
 const HISTORY_LIMIT = 24;
 
 type Side = "buy" | "sell";
@@ -62,6 +63,11 @@ interface CurveNote {
   lastSlot: number;
   complete: boolean;
   seen: boolean;
+  // Scaled trade prices (price * 1_000_000), oldest first, newest
+  // last. Only trade prices go here, so the recent gain below is
+  // measured over real market trades, not over marks or the create
+  // event's opening reserves.
+  tradePrices: bigint[];
 }
 
 interface EntryNote {
@@ -127,6 +133,14 @@ class PaperBot {
   private pendingSells = new Set<string>();
   private closed = new Set<string>();
   private roundTrips = 0;
+  private lastBuySlot = -1000000;
+
+  private recordTradePrice(note: CurveNote): void {
+    if (note.priceDen <= 0n || note.priceNum <= 0n) return;
+    const scaled = (note.priceNum * 1000000n) / note.priceDen;
+    note.tradePrices.push(scaled);
+    if (note.tradePrices.length > HISTORY_LIMIT) note.tradePrices.shift();
+  }
 
   private nextId(prefix: string): string {
     this.orderCounter += 1;
@@ -151,6 +165,7 @@ class PaperBot {
         lastSlot: -1,
         complete: false,
         seen: false,
+        tradePrices: [],
       };
       this.curves.set(mint, note);
     }
@@ -298,6 +313,7 @@ class PaperBot {
           toBig(event.virtual_token_reserves),
           toBig(event.real_quote_reserves),
         );
+        this.recordTradePrice(note);
         if (!seenCandidate.has(event.mint)) {
           seenCandidate.add(event.mint);
           candidates.push(note);
@@ -332,8 +348,15 @@ class PaperBot {
         entry !== undefined &&
         entry.peakBps >= TRAILING_ARMS_AT_BPS &&
         current <= entry.peakBps - TRAILING_DROP_BPS;
+      // A smaller peak that then fades by the same step is also a
+      // reversal, not a pause: exit before the fade becomes the stop.
+      const faded =
+        entry !== undefined &&
+        entry.peakBps >= 10500 &&
+        entry.peakBps < TRAILING_ARMS_AT_BPS &&
+        current <= entry.peakBps - TRAILING_DROP_BPS;
       const timedOut = entry !== undefined && heldSlots >= MAX_HOLD_SLOTS;
-      if (current >= TAKE_PROFIT_BPS || current <= STOP_LOSS_BPS || trailing || timedOut) {
+      if (current >= TAKE_PROFIT_BPS || current <= STOP_LOSS_BPS || trailing || faded || timedOut) {
         orders.push(this.sellAll(mint, held.tokens));
         if (entry !== undefined) this.entries.delete(mint);
       }
@@ -345,6 +368,7 @@ class PaperBot {
     if (committed.size < this.maxOpen) {
       for (const note of candidates) {
         if (orders.length >= this.maxOrders) break;
+        if (slot - this.lastBuySlot < MIN_BUY_COOLDOWN_SLOTS) break;
         if (this.decideEntry(note, slot, committed)) {
           const size = this.buySize(note);
           if (size >= MIN_BUY_FOR_A_ROUND_TRIP) {
@@ -359,6 +383,7 @@ class PaperBot {
             this.pending.set(id, { side: "buy", mint: note.mint });
             this.pendingBuys.add(note.mint);
             committed.add(note.mint);
+            this.lastBuySlot = slot;
             break;
           }
         }
@@ -408,9 +433,17 @@ class PaperBot {
       (note.priceNum * note.firstPriceDen * 10000n) / (note.priceDen * note.firstPriceNum),
     );
     if (gainBps < this.requiredGainBps()) return false;
-    if (gainBps > 16000) return false;
+    if (gainBps > 14000) return false;
+    // The rise must still be happening over the last few trades,
+    // not only over the whole life of the coin: compare the latest
+    // trade price with the one six trades back.
+    if (note.tradePrices.length < 6) return false;
+    const older = note.tradePrices[note.tradePrices.length - 6]!;
+    const latest = note.tradePrices[note.tradePrices.length - 1]!;
+    if (older <= 0n || latest <= 0n) return false;
+    if ((latest * 10000n) / older < 10300n) return false;
     const buys = note.recentBuys.filter((value) => value).length;
-    if (buys < 3) return false;
+    if (buys < 4) return false;
     if (note.totalVolume <= 0n) return false;
     if (note.buyVolume * 100n < note.totalVolume * 55n) return false;
     return true;
