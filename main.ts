@@ -134,6 +134,14 @@ class PaperBot {
   private closed = new Set<string>();
   private roundTrips = 0;
   private lastBuySlot = -1000000;
+  // Signatures already counted, so a duplicated delivery of the
+  // same trade cannot double-count volume or fake momentum.
+  private seenSignatures = new Set<string>();
+  // Mints whose last buy was rejected or failed, until this slot.
+  // A rejected buy costs nothing, but retrying it every batch
+  // wastes the one entry per batch; a failed buy already paid its
+  // network fee, so retrying at once would pay it again.
+  private blockedUntil = new Map<string, number>();
 
   private recordTradePrice(note: CurveNote): void {
     if (note.priceDen <= 0n || note.priceNum <= 0n) return;
@@ -237,6 +245,10 @@ class PaperBot {
         this.pending.delete(id);
         if (known.side === "buy") this.pendingBuys.delete(known.mint);
         if (known.side === "sell") this.pendingSells.delete(known.mint);
+        if (known.side === "buy" && fill.status !== "filled") {
+          const wait = fill.status === "failed" ? 60 : 300;
+          this.blockedUntil.set(known.mint, slot + wait);
+        }
       }
     }
 
@@ -298,14 +310,19 @@ class PaperBot {
       const eventSlot = toInt(event.slot);
       const atSlot = eventSlot >= 0 ? eventSlot : slot;
       if (event.event === "CreateEvent") {
-        note.createdSlot = atSlot;
-        this.notePrice(
-          note,
-          toBig(event.virtual_quote_reserves),
-          toBig(event.virtual_token_reserves),
-          0n,
-        );
+        if (note.createdSlot === null) {
+          note.createdSlot = atSlot;
+          this.notePrice(
+            note,
+            toBig(event.virtual_quote_reserves),
+            toBig(event.virtual_token_reserves),
+            0n,
+          );
+        }
       } else if (event.event === "TradeEvent") {
+        const signature = typeof event.signature === "string" ? event.signature : "";
+        if (signature !== "" && this.seenSignatures.has(signature)) continue;
+        if (signature !== "") this.seenSignatures.add(signature);
         this.noteTrade(note, atSlot, event.is_buy === true, toBig(event.quote_amount));
         this.notePrice(
           note,
@@ -337,7 +354,13 @@ class PaperBot {
         orders.push(this.sellAll(mint, held.tokens));
         continue;
       }
-      if (note.priceNum <= 0n || note.priceDen <= 0n) continue;
+      // No usable mark for this coin: do not hold it on a stale
+      // price until the replay flattens it. Selling lets the
+      // harness price the exit at the last known reserves.
+      if (note.priceNum <= 0n || note.priceDen <= 0n) {
+        orders.push(this.sellAll(mint, held.tokens));
+        continue;
+      }
       const current = ratioBps(note.priceNum, note.priceDen, held.tokens, held.cost);
       const entry = this.entries.get(mint);
       if (entry !== undefined) {
@@ -420,6 +443,8 @@ class PaperBot {
 
   private decideEntry(note: CurveNote, slot: number, committed: Set<string>): boolean {
     if (note.complete) return false;
+    const blocked = this.blockedUntil.get(note.mint);
+    if (blocked !== undefined && slot < blocked) return false;
     if (this.closed.has(note.mint)) return false;
     if (this.positions.has(note.mint)) return false;
     if (committed.has(note.mint)) return false;
@@ -474,6 +499,15 @@ async function main(): Promise<void> {
     try {
       message = JSON.parse(line);
     } catch {
+      // A damaged line cannot be trusted as a batch, but if its
+      // sequence number is still readable the harness is waiting
+      // for that batch's reply: answer it empty rather than stall
+      // the whole replay waiting for a reply that never comes.
+      const seqMatch = /"seq"\s*:\s*([0-9]+)/.exec(line);
+      if (seqMatch !== null) {
+        const seq = Number(seqMatch[1]);
+        process.stdout.write(`${JSON.stringify({ type: "reply", seq, orders: [] })}\n`);
+      }
       continue;
     }
     if (typeof message !== "object" || message === null || Array.isArray(message)) continue;
