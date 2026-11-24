@@ -117,7 +117,6 @@ function ratioBps(
 }
 
 class PaperBot {
-  private capital = 10n * LAMPORTS_PER_SOL;
   private cash = 10n * LAMPORTS_PER_SOL;
   private maxOpen = MAX_OPEN;
   private maxOrders = MAX_ORDERS_PER_BATCH;
@@ -211,10 +210,7 @@ class PaperBot {
     const capital = hello.capital as Record<string, unknown> | undefined;
     if (capital !== undefined) {
       const amount = toBig(capital.lamports);
-      if (amount > 0n) {
-        this.capital = amount;
-        this.cash = amount;
-      }
+      if (amount > 0n) this.cash = amount;
     }
     const caps = hello.caps as Record<string, unknown> | undefined;
     if (caps !== undefined) {
@@ -322,7 +318,14 @@ class PaperBot {
       } else if (event.event === "TradeEvent") {
         const signature = typeof event.signature === "string" ? event.signature : "";
         if (signature !== "" && this.seenSignatures.has(signature)) continue;
-        if (signature !== "") this.seenSignatures.add(signature);
+        if (signature !== "") {
+          // A 24-hour final window can carry far more trades than
+          // the dev window; cap the set so a very long replay
+          // cannot grow it without bound. Clearing it only risks
+          // counting one duplicated trade again, far later.
+          if (this.seenSignatures.size > 400000) this.seenSignatures.clear();
+          this.seenSignatures.add(signature);
+        }
         this.noteTrade(note, atSlot, event.is_buy === true, toBig(event.quote_amount));
         this.notePrice(
           note,
@@ -413,7 +416,6 @@ class PaperBot {
       }
     }
 
-    void HISTORY_LIMIT;
     return orders;
   }
 
